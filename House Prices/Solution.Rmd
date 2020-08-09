@@ -1,0 +1,510 @@
+---
+title: "Housing_Prices_Prediction"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load necessary packages to start
+```{r}
+library(data.table)
+library(ggplot2)
+library(tidyr)
+library(plyr)
+library(dplyr)
+library(moments)   
+library(glmnet)
+library(caret)
+library(Metrics)
+```
+
+
+## To begin, load the training dataset and take a look at the head and other basic characteristics
+
+```{r}
+train <- read.csv('/Users/dshenker/Desktop/Kaggle/House\ Prices/train.csv', header = T)
+test <-  read.csv('/Users/dshenker/Desktop/Kaggle/House\ Prices/test.csv', header = T)
+test$SalePrice <- NA
+all <- rbind(train, test)
+df <- train
+head(df)
+dim(df)
+```
+
+## Check out what the type of each colun is and pick out the ones that are integer
+
+```{r}
+sapply(df,class)
+col_int_nums <- sapply(df, is.numeric)
+df_int <- df[, col_int_nums]
+```
+
+## Look at initial correlations between columns and sort in descending order by correlation
+```{r}
+corr_to_price <- cor(df_int$SalePrice, df_int)
+dim(corr_to_price)
+corr_to_price <- data.frame(corr_to_price)
+row.names(corr_to_price) <- c("Correlation to Sale Price")
+corr_to_price <- transpose(corr_to_price, keep.names = "Feature")
+colnames(corr_to_price) <- c("Feature", "Correlation")
+corr_to_price <- as.data.table(corr_to_price)
+corr_to_price <- corr_to_price[order(-abs(Correlation))]
+corr_to_price
+```
+## Visualize relationship between OverallQual, GrLivArea, and SalePrice
+```{r}
+qualPlot <- ggplot(df, aes(OverallQual, SalePrice))
+qualPlot + geom_point()
+
+livAreaPlot <- ggplot(df, aes(GrLivArea, SalePrice))
+livAreaPlot + geom_point()
+```
+
+#Try to find less straightforward relationships, possibly in year built. Clearly, the relationship is not as linear and clear to see although there is definitely a positive correlation (0.523)
+```{r}
+yearBuiltPlot <- ggplot(df, aes(YearBuilt, SalePrice))
+yearBuiltPlot + geom_point()
+```
+
+
+
+##Figure out which columns have missing values, we will now need to deal with each of these individually
+```{r}
+list_na <- colnames(all)[apply(all, 2, anyNA)]
+list_na
+NAcol <- which(colSums(is.na(all)) > 0)
+sort(colSums(sapply(all[NAcol], is.na)), decreasing = TRUE)
+```
+
+#Filling in PoolQC. With that many missing values, makes sense to ignore this column
+```{r}
+summary(all$PoolQC)
+all <- as.data.table(all)
+all <- all[, PoolQC := NULL]
+```
+
+#Filling in MiscFeature. Same as before, can ignore this column
+```{r}
+summary(all$MiscFeature)
+all <- all[, MiscFeature := NULL]
+```
+
+#Filling in Alley. We turn the NAs into "None" and then add numerics
+```{r}
+summary(all$Alley)
+df <- as.data.table(df)
+alley_pricemeans <- df[, mean(SalePrice), by = .(Alley)]
+alley_pricemeans
+all$Alley <- as.character(all$Alley) #can't add a new type until convert from factor into character
+all$Alley <- replace_na(all$Alley, 'None')
+Qualities <- c('None' = 2, 'Pave' = 1, 'Grvl' = 0)
+all$Alley <- as.integer(revalue(all$Alley, Qualities))
+```
+
+#Filling in Fence. Seems to make a difference in price so add a new type of "None", but cannot seem to assign values, so leave as factor
+```{r}
+summary(all$Fence)
+fence_pricemeans <- df[, mean(SalePrice), by = .(Fence)]
+fence_pricemeans
+all$Fence <- as.character(all$Fence) #can't add a new type until convert from factor into character
+all$Fence <- replace_na(all$Fence, 'None')
+all$Fence <- factor(all$Fence)
+```
+
+#Filling in FirePlaceQu. Having better values seems important so make a new category and also since can order quality, turn this into numeric at the same time with values assigned to fireplace quality
+```{r}
+table(all$FireplaceQu)
+fire_pricemeans <- df[, mean(SalePrice), by = .(FireplaceQu)]
+fire_pricemeans
+all$FireplaceQu <- as.character(all$FireplaceQu) #can't add a new type until convert from factor into character
+all$FireplaceQu <- replace_na(all$FireplaceQu, 'None')
+Qualities <- c('None' = 0, 'Po' = 1, 'Fa' = 2, 'TA' = 3, 'Gd' = 4, 'Ex' = 5)
+all$FireplaceQu <- as.integer(revalue(all$FireplaceQu, Qualities))
+```
+
+#Filling in LotFrontage. For NA's, fill in the average for that neighborhood
+```{r}
+summary(all$LotFrontage)
+lotPlot <- ggplot(df, aes(LotFrontage, SalePrice))
+lotPlot + geom_point()
+lotMeans <- all %>% group_by(Neighborhood) %>% summarize(LotFrontage_Mean = mean(LotFrontage, na.rm = TRUE))
+lotMeans <- as.data.table(lotMeans)
+for (i in 1:nrow(all)){
+  if (is.na(all$LotFrontage[i])) {
+    all$LotFrontage[i] <- lotMeans["Neighborhood" == all$Neighborhood[i], "LotFrontage_Mean"]
+  }
+}
+sum(is.na(all$LotFrontage)) #check that now zero
+```
+
+#Filling in GarageYrBlt
+```{r}
+summary(all$GarageYrBlt)
+all$GarageYrBlt[is.na(all$GarageYrBlt)] <- all$YearBuilt[is.na(all$GarageYrBlt)]
+sum(is.na(all$GarageYrBlt))
+```
+
+#Filling in GarageFinish. Make 'None' a new type because it effects price and assign numeric values
+```{r}
+summary(all$GarageFinish)
+garagefinish_pricemeans <- df[, mean(SalePrice), by = .(GarageFinish)]
+garagefinish_pricemeans
+all$GarageFinish <- as.character(all$GarageFinish)
+all$GarageFinish <- replace_na(all$GarageFinish, 'None')
+Qualities <- c('None' = 0, 'Unf' = 1, 'RFn' = 2, 'Fin' = 3)
+all$GarageFinish <- as.integer(revalue(all$GarageFinish, Qualities))
+```
+
+#Filling in GarageQual. Once again make 'None' a new type
+```{r}
+table(all$GarageQual)
+garagequal_pricemeans <- df[, mean(SalePrice), by = .(GarageQual)]
+garagequal_pricemeans
+all$GarageQual <- as.character(all$GarageQual)
+all$GarageQual <- replace_na(all$GarageQual, 'None')
+Qualities <- c('None' = 0, 'Po' = 1, 'Fa' = 2, 'TA' = 3, 'Gd' = 4, 'Ex' = 5)
+all$GarageQual <- as.integer(revalue(all$GarageQual, Qualities))
+```
+
+#Filling in GarageCond. Same process again
+```{r}
+summary(all$GarageCond)
+garagecond_pricemeans <- df[, mean(SalePrice), by = .(GarageCond)]
+garagecond_pricemeans
+all$GarageCond <- as.character(all$GarageCond)
+all$GarageCond <- replace_na(all$GarageCond, 'None')
+Qualities <- c('None' = 0, 'Po' = 1, 'Fa' = 2, 'TA' = 3, 'Gd' = 4, 'Ex' = 5)
+all$GarageCond <- as.integer(revalue(all$GarageCond, Qualities))
+```
+
+#Filling in GarageType. Same again.
+```{r}
+summary(all$GarageType)
+all$GarageType <- as.character(all$GarageType)
+all$GarageType <- replace_na(all$GarageType, 'None')
+all$GarageType <- factor(all$GarageType)
+```
+
+#Filling in BsmtCond. Create 'None' again
+```{r}
+summary(all$BsmtCond)
+bsmtcond_pricemeans <- df[, mean(SalePrice), by = .(BsmtCond)]
+bsmtcond_pricemeans
+all$BsmtCond <- as.character(all$BsmtCond)
+all$BsmtCond <- replace_na(all$BsmtCond, 'None')
+Qualities <- c('None' = 0, 'Po' = 1, 'Fa' = 2, 'TA' = 3, 'Gd' = 4, 'Ex' = 5)
+all$BsmtCond <- as.integer(revalue(all$BsmtCond, Qualities))
+```
+
+#Filling in BsmtExposure. Same procedure
+```{r}
+summary(all$BsmtExposure)
+bsmtexposure_pricemeans <- df[, mean(SalePrice), by = .(BsmtExposure)]
+bsmtexposure_pricemeans
+all$BsmtExposure <- as.character(all$BsmtExposure)
+all$BsmtExposure <- replace_na(all$BsmtExposure, 'None')
+Qualities <- c('None' = 0, 'No' = 1, 'Mn' = 2, 'Av' = 3, 'Gd' = 4)
+all$BsmtExposure <- as.integer(revalue(all$BsmtExposure, Qualities))
+```
+
+#Filling in BsmtQual.
+```{r}
+summary(all$BsmtQual)
+all$BsmtQual <- as.character(all$BsmtQual)
+all$BsmtQual <- replace_na(all$BsmtQual, 'None')
+Qualities <- c('None' = 0, 'Po' = 1, 'Fa' = 2, 'TA' = 3, 'Gd' = 4, 'Ex' = 5)
+all$BsmtQual <- as.integer(revalue(all$BsmtQual, Qualities))
+```
+
+#Filling in BsmtFinType2
+```{r}
+summary(all$BsmtFinType2)
+all$BsmtFinType2 <- as.character(all$BsmtFinType2)
+all$BsmtFinType2 <- replace_na(all$BsmtFinType2, 'None')
+all$BsmtFinType2 <- factor(all$BsmtFinType2)
+```
+
+#Filling in BsmtFinType1
+```{r}
+summary(all$BsmtFinType1)
+all$BsmtFinType1 <- as.character(all$BsmtFinType1)
+all$BsmtFinType1 <- replace_na(all$BsmtFinType1, 'None')
+all$BsmtFinType1 <- factor(all$BsmtFinType1)
+```
+
+#Filling in MasVnrType. Unclear what NA is so get rid of column.
+```{r}
+summary(all$MasVnrType)
+masvnrtype_pricemeans <- df[, mean(SalePrice), by = .(MasVnrType)]
+masvnrtype_pricemeans
+all <- all[, MasVnrType := NULL]
+```
+
+#Filling in MasVnrArea. If NA then make it 0
+```{r}
+summary(all$MasVnrArea)
+all$MasVnrArea[is.na(all$MasVnrArea)] <-0
+```
+
+#Filling in MSZoning
+```{r}
+summary(all$MSZoning) #RL is by far the most popular, fill NA's with that
+mszoning_pricemeans <- df[, mean(SalePrice), by = .(MSZoning)]
+mszoning_pricemeans
+all$MSZoning[is.na(all$MSZoning)] <- "RL"
+all$MSZoning <- factor(all$MSZoning)
+```
+
+#Filling in Utilities
+```{r}
+summary(all$Utilities) #all except 3 houses have AllPub, so not useful
+all <- all[, Utilities := NULL]
+```
+
+#Filling in BsmtFullBath. Both of the NA's don't have basements so set to 0.
+```{r}
+summary(all$BsmtFullBath)
+all$BsmtFullBath[is.na(all$BsmtFullBath)] <-0
+
+```
+
+#Filling in BsmtHalfBath. Once again put 0's in for the NA's
+```{r}
+summary(all$BsmtHalfBath)
+all$BsmtHalfBath[is.na(all$BsmtHalfBath)] <-0
+```
+
+#Filling in Functional. Set NA's to Typical
+```{r}
+summary(all$Functional)
+all$Functional[is.na(all$Functional)] <- 'Typ'
+all$Functional <- factor(all$Functional)
+```
+
+#Filling in Exterior1st. Set NA to the mode, which is VinylSD
+```{r}
+summary(all$Exterior1st)
+all$Exterior1st[is.na(all$Exterior1st)] <- 'VinylSd'
+all$Exterior1st <- factor(all$Exterior1st)
+```
+
+#Filling in Exterior2nd. Set NA to the mode, which is VinylSd
+```{r}
+summary(all$Exterior2nd)
+all$Exterior2nd[is.na(all$Exterior2nd)] <- 'VinylSd'
+all$Exterior2nd <- factor(all$Exterior2nd)
+```
+
+#Filling in BsmtFinSF1. Since BsmtQual is None, can assume that the NA value should be 0.
+```{r}
+summary(all$BsmtFinSF1)
+bsmtPlot <- ggplot(df, aes(BsmtFinSF1, SalePrice))
+bsmtPlot + geom_point()
+all[is.na(all$BsmtFinSF1),]
+all$BsmtFinSF1[is.na(all$BsmtFinSF1)] <- 0
+```
+
+#Filling in BsmtSF2. Once again, can safely set the NA to 0.
+```{r}
+summary(all$BsmtFinSF2)
+all[is.na(all$BsmtFinSF2),]
+all$BsmtFinSF2[is.na(all$BsmtFinSF2)] <- 0
+```
+
+#Filling in BsmtUnfSF. Same as before and set to 0.
+```{r}
+summary(all$BsmtUnfSF)
+all$BsmtUnfSF[is.na(all$BsmtUnfSF)] <- 0
+```
+
+#Filling in TotalBsmtSF. Same as before and set to 0.
+```{r}
+summary(all$TotalBsmtSF)
+all[is.na(all$TotalBsmtSF),]
+all$TotalBsmtSF[is.na(all$TotalBsmtSF)] <- 0
+```
+
+#Filling in Electrical. SBrkr is by far the most common, so set NA to that
+```{r}
+summary(all$Electrical)
+all$Electrical[is.na(all$Electrical)] <- 'SBrkr'
+all$Electrical <- factor(all$Electrical)
+```
+
+#Filling in KitchenQual. TA is most common so use that for NA
+```{r}
+summary(all$KitchenQual)
+all$KitchenQual[is.na(all$KitchenQual)] <- 'TA'
+Qualities <- c('None' = 0, 'Po' = 1, 'Fa' = 2, 'TA' = 3, 'Gd' = 4, 'Ex' = 5)
+all$KitchenQual <- as.integer(revalue(all$KitchenQual, Qualities))
+```
+
+#Filling in GarageCars. Since GarageFinish is None, can set GarageCars to 0.
+```{r}
+summary(all$GarageCars)
+all[is.na(all$GarageCars),]
+all$GarageCars[is.na(all$GarageCars)] <- 0
+```
+
+#Filling in GarageArea. Set NA to 0
+```{r}
+summary(all$GarageArea)
+all[is.na(all$GarageArea),]
+all$GarageArea[is.na(all$GarageArea)] <- 0
+```
+
+#Filling in SaleType. Set NA to mode, which is WD
+```{r}
+summary(all$SaleType)
+all$SaleType[is.na(all$SaleType)] <- 'WD'
+all$SaleType <- factor(all$SaleType)
+```
+
+#Check that there are no longer any NA values, except for in SalePrice, which is from the 
+```{r}
+list_na_final <- colnames(all)[apply(all, 2, anyNA)]
+list_na_final
+```
+
+#Need to look at the other character variables that we may need to assign numeric values to.
+```{r}
+sapply(all,class)
+factorVars <- which(sapply(all, is.factor))
+summary(all$Street)
+```
+
+#Creating a combined bathroom feature and getting rid of the previously used columns
+```{r}
+all$BathCount <- 0.5 * all$BsmtHalfBath + all$BsmtFullBath + 0.5 * all$HalfBath + all$FullBath
+head(all$BathCount)
+all <- all[, FullBath := NULL]
+all <- all[, HalfBath := NULL]
+all <- all[, BsmtHalfBath := NULL]
+all <- all[, BsmtFullBath := NULL]
+```
+
+#Combining all outside square footage values into a single one and getting rid of the previously used columns
+```{r}
+all$OutsideSF <- all$WoodDeckSF + all$OpenPorchSF + all$EnclosedPorch + all$X3SsnPorch + all$ScreenPorch
+all <- all[, WoodDeckSF := NULL]
+all <- all[, OpenPorchSF := NULL]
+all <- all[, EnclosedPorch := NULL]
+all <- all[, X3SsnPorch := NULL]
+all <- all[, ScreenPorch := NULL]
+summary(all$OutsideSF)
+```
+
+#Adding age of home as a variable
+```{r}
+all$Age <- all$YrSold - all$YearBuilt
+all$YrSold <- factor(all$YrSold)
+summary(all$YrSold)
+```
+
+#Add variable with 1 if has remodeled and 0 otherwise
+```{r}
+all$Remodeled <- ifelse(all$YearBuilt == all$YearRemodAdd, 0, 1)
+summary(all$Remodeled)
+```
+
+#Add variable to check if house is new
+```{r}
+all$New <- ifelse(all$YearBuilt == all$YrSold, 1, 0)
+summary(all$New)
+```
+
+#Add variable with total square footage of the house and get rid of other square footage related columns
+```{r}
+all$TotalSF <- all$GrLivArea + all$TotalBsmtSF
+summary(all$TotalSF)
+all <- all[, GrLivArea := NULL]
+all <- all[, TotalBsmtSF := NULL]
+all <- all[, BsmtFinSF1 := NULL]
+all <- all[, BsmtFinSF2 := NULL]
+all <- all[, BsmtUnfSF := NULL]
+all <- all[, X1stFlrSF := NULL]
+all <- all[, X2ndFlrSF := NULL]
+all <- all[, LowQualFinSF := NULL]
+```
+
+#Check skewness of each numeric variable and take log if skew greater than 1
+```{r}
+numeric_part <- select_if(all, is.numeric)
+colnames(numeric_part)
+#Check skewness for the following: LotArea, MasVnrArea, GarageArea, PoolArea, OutsideSF, Age, TotalSF
+cols_tocheck <- c("LotArea", "MasVnrArea", "GarageArea", "PoolArea", "OutsideSF", "Age", "TotalSF")
+
+skew <- skewness(all[, "LotArea"])
+skew #12.82243 
+all$LotArea <- log(all$LotArea + 1)
+
+skew <- skewness(all[, "MasVnrArea"])
+skew # 2.613592 
+all$MasVnrArea <- log(all$MasVnrArea + 1)
+
+skew <- skewness(all[, "GarageArea"])
+skew #0.2392569 (no need to take log)
+
+skew <- skewness(all[, "PoolArea"])
+skew #16.89833
+all$PoolArea <- log(all$PoolArea + 1)
+
+skew <- skewness(all[, "OutsideSF"])
+skew #1.376649
+all$OutsideSF <- log(all$OutsideSF + 1)
+
+skew <- skewness(all[, "Age"])
+skew #0.5986094 (no need to take log)
+
+skew <- skewness(all[, "TotalSF"])
+skew #1.511157
+all$TotalSF <- log(all$TotalSF + 1)
+```
+
+#Use model.matrix function to encode the factors as values
+```{r}
+df_numeric <- select_if(all, is.numeric)
+df_factor <- select_if(all, is.factor)
+df_encoded <- as.data.frame(model.matrix(~.-1, df_factor))
+df_full <- cbind(df_numeric, df_encoded)
+dim(df_full)
+```
+
+#Split data into test and train
+```{r}
+train <- df_full[!is.na(all$SalePrice)]
+test <- df_full[is.na(all$SalePrice)]
+skew <- skewness(train$SalePrice)
+skew #1.880941
+train$SalePrice <- log(train$SalePrice + 1)
+```
+
+#Train the Lasso Regression Model
+```{r}
+train_matrix <- model.matrix(SalePrice ~ ., data = train)
+test$SalePrice <- 0
+test_matrix <- model.matrix(SalePrice ~ ., data = test)
+set.seed(86)
+lambda_seq <- seq(0.001, 0.1, by = 0.0005)
+cv_output <- cv.glmnet(train_matrix, train$SalePrice, alpha = 1, lambda = lambda_seq, nfolds = 5)
+best_lam <- cv_output$lambda.min
+best_lam
+lasso_best <- glmnet(train_matrix, train$SalePrice, alpha = 1, lambda = best_lam)
+summary(lasso_best)
+coef(lasso_best)
+pred <- predict(lasso_best, s = best_lam, newx = train_matrix)
+rmse(train$SalePrice, pred)
+#my_control <-trainControl(method="cv", number=5)
+#lassoGrid <- expand.grid(alpha = 1, lambda = seq(0.001,0.1,by = 0.0005))
+#lasso_mod <- train(x=train_matrix, y=as.numeric(train[, "SalePrice"]), method='glmnet', trControl= my_control, tuneGrid=lassoGrid) 
+
+test_pred <- predict(lasso_best, s = best_lam, newx = test_matrix)
+head(test_pred)
+final_pred_test <- exp(test_pred) #reverse the log transformation
+head(final_pred_test)
+test$SalePrice <- final_pred_test
+submission <- data.frame(test$Id, test$SalePrice) #get the columns we need
+write.csv(submission, "price_submission.csv")
+```
